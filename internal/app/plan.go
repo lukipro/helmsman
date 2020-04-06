@@ -86,25 +86,45 @@ func (p *plan) exec() {
 		log.Info("Nothing to execute")
 	}
 
+	wg := sync.WaitGroup{}
+	sem := make(chan struct{}, flags.parallel)
+	var priorities []int
+	pl := make(map[int][]orderedCommand)
 	for _, cmd := range p.Commands {
-		log.Notice(cmd.Command.Description)
-		result := cmd.Command.exec()
-		if cmd.targetRelease != nil && !flags.dryRun && !flags.destroy {
-			cmd.targetRelease.label()
+		priorities = append(priorities, cmd.Priority)
+		pl[cmd.Priority] = append(pl[cmd.Priority], cmd)
+	}
+
+	for _, priority := range priorities {
+		for _, cmd := range pl[priority] {
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(cmd orderedCommand) {
+				defer func() {
+					wg.Done()
+					<-sem
+				}()
+				log.Notice(cmd.Command.Description)
+				result := cmd.Command.exec()
+				if cmd.targetRelease != nil && !flags.dryRun && !flags.destroy {
+					cmd.targetRelease.label()
+				}
+				if result.code != 0 {
+					errorMsg := result.errors
+					if !flags.verbose {
+						errorMsg = strings.Split(result.errors, "---")[0]
+					}
+					log.Fatal(fmt.Sprintf("Command returned [ %d ] exit code and error message [ %s ]", result.code, strings.TrimSpace(errorMsg)))
+				} else {
+					log.Notice(result.output)
+					log.Notice("Finished: " + cmd.Command.Description)
+					if _, err := url.ParseRequestURI(settings.SlackWebhook); err == nil {
+						notifySlack(cmd.Command.Description+" ... SUCCESS!", settings.SlackWebhook, false, true)
+					}
+				}
+			}(cmd)
 		}
-		if result.code != 0 {
-			errorMsg := result.errors
-			if !flags.verbose {
-				errorMsg = strings.Split(result.errors, "---")[0]
-			}
-			log.Fatal(fmt.Sprintf("Command returned [ %d ] exit code and error message [ %s ]", result.code, strings.TrimSpace(errorMsg)))
-		} else {
-			log.Notice(result.output)
-			log.Notice("Finished: " + cmd.Command.Description)
-			if _, err := url.ParseRequestURI(settings.SlackWebhook); err == nil {
-				notifySlack(cmd.Command.Description+" ... SUCCESS!", settings.SlackWebhook, false, true)
-			}
-		}
+		wg.Wait()
 	}
 
 	if len(p.Commands) > 0 {
